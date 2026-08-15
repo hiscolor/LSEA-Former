@@ -3,11 +3,12 @@ from .blocks import (
     TransformerBlock, ConvBlock, Scale, AffineDropPath,
 )
 from .models import make_backbone, make_neck, make_meta_arch, make_generator
-from .motion import MotionProxy, MotionAwareScoreCalibrator
 from .video_cls_modules import (
-    VideoClassificationHead, FrequencyEvidenceBranch,
-    CMAMFromAMFlow, MotionGateCalibration, TopKLogSumExpAggregator,
-    SegmentHead, CMAMModule,
+    FrequencyEvidenceBranch,
+    AVMCModule,
+    MotionGateCalibration,
+    TopKLogSumExpAggregator,
+    SegmentHead,
 )
 from . import backbones
 from . import necks
@@ -18,4 +19,3 @@ from .skd_distillation import (
     SKDDistillationWrapper,
     load_fcad_teacher,
 )
-from .skd_distillation_v2 import SKDDistillationWrapperV2

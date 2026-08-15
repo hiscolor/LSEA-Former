@@ -123,12 +123,9 @@ class SelectiveKnowledgeDistillation(nn.Module):
         """
 
         H_t = bernoulli_entropy(teacher_clip_probs)
-
-
+        C_t = 1.0 - H_t / math.log(2.0)
         D_t = bernoulli_kl_divergence(teacher_clip_probs, student_clip_probs)
-
-
-        s_t = self.alpha * H_t + (1 - self.alpha) * D_t
+        s_t = self.alpha * C_t + (1 - self.alpha) * D_t
 
 
         s_t = s_t.masked_fill(~mask, float('-inf'))
@@ -370,8 +367,8 @@ class SKDDistillationWrapper(nn.Module):
             student_seg_logits_calib=student_seg_logits_calib,
             teacher_vid_logit=teacher_outputs['vid_logit'],
             student_vid_logit=student_outputs['vid_logit'],
-            teacher_clip_probs=torch.sigmoid(teacher_seg_logits),
-            student_clip_probs=torch.sigmoid(student_seg_logits),
+            teacher_clip_probs=torch.sigmoid(teacher_seg_logits_calib),
+            student_clip_probs=torch.sigmoid(student_seg_logits_calib),
             teacher_motion_gate=teacher_motion_gate,
             gt_video_labels=gt_video_labels,
             mask=mask,
@@ -389,101 +386,29 @@ class SKDDistillationWrapper(nn.Module):
         return combined_losses
 
     def _get_student_outputs_with_grad(self, video_list) -> dict:
-        """获取 student 的中间输出（带梯度）"""
         batched_inputs, batched_masks = self.student.preprocessing(video_list)
-
-
-        if self.student.enable_feb and self.student.feb is not None:
-            target_len = batched_inputs.shape[-1]
-            freq_evidence = self.student._get_freq_evidence(video_list, target_len=target_len)
-            if freq_evidence is not None:
-                batched_inputs, _, _ = self.student.feb(
-                    batched_inputs.permute(0, 2, 1),
-                    freq_evidence,
-                    batched_masks.squeeze(1)
-                )
-
-
-        feats, masks = self.student.backbone(batched_inputs, batched_masks)
-        stem_feat = feats[0]
-        stem_mask = masks[0]
-
-
-        seg_logits = self.student.segment_head(stem_feat, stem_mask)
-
-
-        motion_intensity = self.student._compute_motion_intensity(stem_feat, stem_mask)
-        if self.student.motion_gate is not None:
-            seg_logits_calib, gate_values = self.student.motion_gate(seg_logits, motion_intensity)
-        else:
-            seg_logits_calib = seg_logits
-            gate_values = torch.ones_like(seg_logits)
-
-
-        mask_2d = stem_mask.squeeze(1) if stem_mask.dim() == 3 else stem_mask
-        vid_logit, _, _, _ = self.student.aggregator(seg_logits_calib, stem_feat, mask_2d)
-
+        encoded = self.student._encode_temporal(batched_inputs, batched_masks, video_list)
         return {
-            'seg_logits': seg_logits,
-            'seg_logits_calib': seg_logits_calib,
-            'vid_logit': vid_logit.squeeze(-1),
-            'motion_gate': gate_values,
-            'mask': mask_2d.bool(),
+            'seg_logits': encoded['seg_logits'],
+            'seg_logits_calib': encoded['seg_logits_calib'],
+            'vid_logit': encoded['vid_logit'].squeeze(-1),
+            'motion_gate': encoded['gate_values'],
+            'mask': encoded['mask_2d'].bool(),
         }
 
     def _get_teacher_outputs(self, video_list) -> dict:
-        """获取 teacher 的中间输出 (no grad)"""
-
         was_training = self.teacher.training
         self.teacher.train()
-
         batched_inputs, batched_masks = self.teacher.preprocessing(video_list)
-
-
-        if hasattr(self.teacher, 'enable_feb') and self.teacher.enable_feb and self.teacher.feb is not None:
-            target_len = batched_inputs.shape[-1]
-            freq_evidence = self.teacher._get_freq_evidence(video_list, target_len=target_len)
-            if freq_evidence is not None:
-                batched_inputs, _, _ = self.teacher.feb(
-                    batched_inputs.permute(0, 2, 1),
-                    freq_evidence,
-                    batched_masks.squeeze(1)
-                )
-
-
-        feats, masks = self.teacher.backbone(batched_inputs, batched_masks)
-        stem_feat = feats[0]
-        stem_mask = masks[0]
-
-
-        seg_logits = self.teacher.segment_head(stem_feat, stem_mask)
-
-
-        if hasattr(self.teacher, '_compute_motion_intensity'):
-            motion_intensity = self.teacher._compute_motion_intensity(stem_feat, stem_mask)
-        else:
-            motion_intensity = torch.zeros_like(seg_logits)
-
-        if hasattr(self.teacher, 'motion_gate') and self.teacher.motion_gate is not None:
-            seg_logits_calib, gate_values = self.teacher.motion_gate(seg_logits, motion_intensity)
-        else:
-            seg_logits_calib = seg_logits
-            gate_values = torch.ones_like(seg_logits)
-
-
-        mask_2d = stem_mask.squeeze(1) if stem_mask.dim() == 3 else stem_mask
-        vid_logit, _, _, _ = self.teacher.aggregator(seg_logits_calib, stem_feat, mask_2d)
-
-
+        encoded = self.teacher._encode_temporal(batched_inputs, batched_masks, video_list)
         if not was_training:
             self.teacher.eval()
-
         return {
-            'seg_logits': seg_logits,
-            'seg_logits_calib': seg_logits_calib,
-            'vid_logit': vid_logit.squeeze(-1),
-            'motion_gate': gate_values,
-            'mask': mask_2d.bool(),
+            'seg_logits': encoded['seg_logits'],
+            'seg_logits_calib': encoded['seg_logits_calib'],
+            'vid_logit': encoded['vid_logit'].squeeze(-1),
+            'motion_gate': encoded['gate_values'],
+            'mask': encoded['mask_2d'].bool(),
         }
 
     def _get_gt_video_labels(self, video_list) -> torch.Tensor:

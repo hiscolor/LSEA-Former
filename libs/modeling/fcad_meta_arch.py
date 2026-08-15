@@ -8,7 +8,7 @@ from .blocks import MaskedConv1D, Scale, LayerNorm
 from .losses import ctr_diou_loss_1d, sigmoid_focal_loss
 from .video_cls_modules import (
     FrequencyEvidenceBranch,
-    CMAMModule,
+    AVMCModule,
     MotionGateCalibration,
     TopKLogSumExpAggregator,
     SegmentHead,
@@ -243,13 +243,9 @@ class FCADFormer(nn.Module):
 
 
         feb_cfg = fcad_cfg.get('feb', {})
-        self.feb_evidence_dim = feb_cfg.get('evidence_dim', 128)
-        self.feb_input_evidence_dim = feb_cfg.get('input_evidence_dim', None)
+        self.feb_temporal_dim = feb_cfg.get('temporal_dim', 16)
         self.feb_topk_patches = feb_cfg.get('topk_patches', 64)
         self.feb_num_heads = feb_cfg.get('num_heads', 4)
-        self.feb_temporal_pooling = feb_cfg.get('temporal_pooling', 'per_clip')
-        self.feb_input_adapter = feb_cfg.get('input_adapter', 'linear')
-        self.feb_spectral_size = feb_cfg.get('spectral_size', 16)
 
 
         self.test_pre_nms_thresh = test_cfg['pre_nms_thresh']
@@ -337,14 +333,11 @@ class FCADFormer(nn.Module):
         if self.enable_feb:
             self.feb = FrequencyEvidenceBranch(
                 videomae_dim=total_input_dim,
-                evidence_dim=self.feb_evidence_dim,
                 hidden_dim=head_dim,
+                temporal_dim=self.feb_temporal_dim,
                 topk_patches=self.feb_topk_patches,
                 num_heads=self.feb_num_heads,
-                input_evidence_dim=self.feb_input_evidence_dim,
-                temporal_pooling=self.feb_temporal_pooling,
-                input_adapter=self.feb_input_adapter,
-                spectral_size=self.feb_spectral_size,
+                dropout=self.train_dropout,
             )
         else:
             self.feb = None
@@ -360,10 +353,14 @@ class FCADFormer(nn.Module):
 
 
         if self.enable_cmam:
-            self.cmam = CMAMModule()
+            stem_window = self.mha_win_size[0] if self.mha_win_size[0] > 0 else 7
+            self.avmc = AVMCModule(
+                n_head=n_head,
+                window_size=stem_window,
+            )
             self.motion_gate = MotionGateCalibration()
         else:
-            self.cmam = None
+            self.avmc = None
             self.motion_gate = None
 
 
@@ -374,28 +371,6 @@ class FCADFormer(nn.Module):
             tau=self.tau,
         )
 
-
-
-
-        self.cls_temporal_attn = nn.Sequential(
-            nn.Linear(embd_dim, 64),
-            nn.Tanh(),
-            nn.Linear(64, 1),
-        )
-        combined_cls_dim = total_input_dim * 2 + embd_dim
-        self.vid_cls_combined = nn.Sequential(
-            nn.Linear(combined_cls_dim, 768),
-            nn.LayerNorm(768),
-            nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Linear(768, 256),
-            nn.LayerNorm(256),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, 1),
-        )
-
-
         self.loss_normalizer = train_cfg['init_loss_norm']
         self.loss_normalizer_momentum = 0.9
 
@@ -405,6 +380,75 @@ class FCADFormer(nn.Module):
     @property
     def device(self):
         return list(set(p.device for p in self.parameters()))[0]
+
+    def _format_attention(self, attention, batch_size):
+        if attention is None:
+            return None
+        if attention.dim() == 4:
+            if attention.shape[0] == batch_size:
+                return attention
+            if attention.shape[2] == attention.shape[3]:
+                B, H, T, _ = attention.shape
+                return attention
+            B, T, H, W = attention.shape
+            return attention
+        if attention.dim() == 3:
+            B = batch_size
+            total, T, W = attention.shape
+            n_head = total // B
+            return attention.view(B, n_head, T, W).permute(0, 2, 1, 3)
+        return attention
+
+    def _encode_temporal(self, batched_inputs, batched_masks, video_list):
+        if self.enable_feb and self.feb is not None:
+            target_len = batched_inputs.shape[-1]
+            freq_evidence = self._get_freq_evidence(video_list, target_len=target_len)
+            if freq_evidence is not None:
+                batched_inputs, _, _ = self.feb(
+                    batched_inputs.permute(0, 2, 1),
+                    freq_evidence,
+                    batched_masks.squeeze(1)
+                )
+        return_aux = self.enable_cmam and self.avmc is not None
+        if return_aux:
+            feats, masks, aux = self.backbone(
+                batched_inputs, batched_masks, return_aux=True
+            )
+            attention = aux.get('attention')
+        else:
+            feats, masks = self.backbone(batched_inputs, batched_masks)
+            attention = None
+        stem_feat = feats[0]
+        stem_mask = masks[0]
+        mask_2d = stem_mask.squeeze(1) if stem_mask.dim() == 3 else stem_mask
+        seg_logits = self.segment_head(stem_feat, stem_mask)
+        if self.enable_cmam and self.avmc is not None and attention is not None:
+            att = self._format_attention(attention, batched_inputs.shape[0])
+            disturbance = self.avmc(att, stem_mask)
+            seg_logits_calib, gate_values = self.motion_gate(seg_logits, disturbance)
+            motion_intensity = disturbance
+        else:
+            motion_intensity = torch.zeros_like(seg_logits)
+            seg_logits_calib = seg_logits
+            gate_values = torch.ones_like(seg_logits)
+        vid_logit, topk_idx, topk_weights, _ = self.aggregator(
+            seg_logits_calib, stem_feat, mask_2d
+        )
+        return {
+            'batched_inputs': batched_inputs,
+            'feats': feats,
+            'masks': masks,
+            'stem_feat': stem_feat,
+            'stem_mask': stem_mask,
+            'mask_2d': mask_2d,
+            'seg_logits': seg_logits,
+            'seg_logits_calib': seg_logits_calib,
+            'motion_intensity': motion_intensity,
+            'gate_values': gate_values,
+            'vid_logit': vid_logit,
+            'topk_idx': topk_idx,
+            'topk_weights': topk_weights,
+        }
 
     def forward(self, video_list):
         """
@@ -419,72 +463,24 @@ class FCADFormer(nn.Module):
         """
 
         batched_inputs, batched_masks = self.preprocessing(video_list)
-
-
-        if self.enable_feb and self.feb is not None:
-            target_len = batched_inputs.shape[-1]
-            freq_evidence = self._get_freq_evidence(video_list, target_len=target_len)
-            if freq_evidence is not None:
-                batched_inputs, _, _ = self.feb(
-                    batched_inputs.permute(0, 2, 1),
-                    freq_evidence,
-                    batched_masks.squeeze(1)
-                )
-
-
-        mask_pool = batched_masks.float()
-        raw_avg = (batched_inputs * mask_pool).sum(dim=2) / mask_pool.sum(dim=2).clamp(min=1)
-        raw_max = batched_inputs.masked_fill(~batched_masks.bool(), float('-inf')).max(dim=2)[0]
-
-
-        feats, masks = self.backbone(batched_inputs, batched_masks)
-
-
-        stem_feat = feats[0]
-        stem_mask = masks[0]
-        mask_2d = stem_mask.squeeze(1) if stem_mask.dim() == 3 else stem_mask
-
-        stem_det = stem_feat.detach().permute(0, 2, 1)
-        attn_scores = self.cls_temporal_attn(stem_det).squeeze(-1)
-        attn_scores = attn_scores.masked_fill(~mask_2d, float('-inf'))
-        attn_weights = F.softmax(attn_scores, dim=1)
-        attended_feat = (stem_det * attn_weights.unsqueeze(-1)).sum(dim=1)
-
-
-        vid_feat = torch.cat([raw_avg, raw_max, attended_feat], dim=1)
-        vid_logit = self.vid_cls_combined(vid_feat)
-
+        encoded = self._encode_temporal(batched_inputs, batched_masks, video_list)
+        feats = encoded['feats']
+        masks = encoded['masks']
+        stem_feat = encoded['stem_feat']
+        stem_mask = encoded['stem_mask']
+        mask_2d = encoded['mask_2d']
+        seg_logits = encoded['seg_logits']
+        seg_logits_calib = encoded['seg_logits_calib']
+        motion_intensity = encoded['motion_intensity']
+        vid_logit = encoded['vid_logit']
 
         fpn_feats, fpn_masks = self.neck(feats, masks)
-
-
         points = self.point_generator(fpn_feats)
-
-
         out_cls_logits = self.cls_head(fpn_feats, fpn_masks)
         out_offsets = self.reg_head(fpn_feats, fpn_masks)
-
-
         out_cls_logits = [x.permute(0, 2, 1) for x in out_cls_logits]
         out_offsets = [x.permute(0, 2, 1) for x in out_offsets]
         fpn_masks_squeezed = [x.squeeze(1) for x in fpn_masks]
-
-
-        seg_logits = self.segment_head(stem_feat, stem_mask)
-
-
-        if self.enable_cmam and self.cmam is not None:
-            motion_intensity = self._compute_motion_intensity(stem_feat, stem_mask)
-            seg_logits_calib, gate_values = self.motion_gate(seg_logits, motion_intensity)
-        else:
-            motion_intensity = torch.zeros_like(seg_logits)
-            seg_logits_calib = seg_logits
-            gate_values = torch.ones_like(seg_logits)
-
-
-        vid_logit_mil, topk_idx, topk_weights, pooled_feat = self.aggregator(
-            seg_logits_calib, stem_feat, mask_2d
-        )
 
         if self.training:
             return self._compute_losses(
@@ -498,53 +494,8 @@ class FCADFormer(nn.Module):
                 video_list, points, fpn_masks_squeezed,
                 out_cls_logits, out_offsets,
                 seg_logits, seg_logits_calib, vid_logit,
-                motion_intensity, vid_logit_mil
+                motion_intensity
             )
-
-    def _compute_motion_intensity(self, features, mask):
-        """
-        计算 motion intensity
-
-        使用特征的时序差分作为 motion proxy (简化版 CMAM)
-        论文中使用 attention dynamics, 这里使用特征差分作为近似
-
-        Args:
-            features: [B, D, L]
-            mask: [B, 1, L]
-
-        Returns:
-            motion_intensity: [B, L] 范围 [0, 1]
-        """
-        B, D, L = features.shape
-
-
-        feat_diff = torch.abs(features[:, :, 1:] - features[:, :, :-1])
-
-
-        motion_diff = feat_diff.mean(dim=1)
-
-
-        motion_intensity = F.pad(motion_diff, (1, 0), value=0)
-
-
-
-
-        if self.cmam is not None:
-            motion_intensity = torch.sigmoid(
-                self.cmam.lambda_param * motion_intensity + self.cmam.bias_param
-            )
-        else:
-
-            min_val = motion_intensity.min(dim=1, keepdim=True)[0]
-            max_val = motion_intensity.max(dim=1, keepdim=True)[0]
-            motion_intensity = (motion_intensity - min_val) / (max_val - min_val + 1e-6)
-
-
-        if mask is not None:
-            mask_float = mask.squeeze(1).float() if mask.dim() == 3 else mask.float()
-            motion_intensity = motion_intensity * mask_float
-
-        return motion_intensity
 
     def _get_freq_evidence(self, video_list, target_len=None):
         """获取频率 patch evidence，并 padding/interpolate 到目标长度"""
@@ -714,7 +665,7 @@ class FCADFormer(nn.Module):
 
 
         first_fpn_len = fpn_masks[0].shape[1]
-        valid_seg_logits = seg_logits[:, :first_fpn_len]
+        valid_seg_logits = seg_logits_calib[:, :first_fpn_len]
         first_mask = fpn_masks[0][:, :first_fpn_len]
         if first_mask.dim() == 3:
             first_mask = first_mask.squeeze(1)
@@ -840,7 +791,7 @@ class FCADFormer(nn.Module):
         self, video_list, points, fpn_masks,
         out_cls_logits, out_offsets,
         seg_logits, seg_logits_calib, vid_logit,
-        motion_intensity, vid_logit_mil=None
+        motion_intensity
     ):
         """推理"""
         results = []
@@ -859,11 +810,7 @@ class FCADFormer(nn.Module):
             fpn_masks_per_vid = [x[idx] for x in fpn_masks]
 
             prob_direct = torch.sigmoid(vid_logit[idx]).item()
-            if vid_logit_mil is not None:
-                prob_mil = torch.sigmoid(vid_logit_mil[idx]).item()
-                vid_prob = 0.5 * prob_direct + 0.5 * prob_mil
-            else:
-                vid_prob = prob_direct
+            vid_prob = prob_direct
 
 
             loc_results = self._inference_single_video(

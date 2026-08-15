@@ -78,8 +78,7 @@ train_cfg:
     topk_min: 5
     tau: 1.0
     feb:
-      evidence_dim: 128
-      input_evidence_dim: 14
+      temporal_dim: 16
       topk_patches: 64
       num_heads: 4
 test_cfg:

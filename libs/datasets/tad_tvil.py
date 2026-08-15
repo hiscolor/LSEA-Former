@@ -384,16 +384,18 @@ class TAD_TVILDataset(Dataset):
                     )
                     feb_feats = feb_resized.squeeze(0).T.numpy().reshape(vmae_L, P, E)
 
+                if feb_feats.shape[-1] != 16:
+                    profile = feb_feats[..., :8]
+                    band_var = profile.var(axis=-1, keepdims=True)
+                    feb_feats = np.repeat(band_var, 16, axis=-1).astype(np.float32)
 
                 data_dict['freq_evidence'] = torch.from_numpy(np.ascontiguousarray(feb_feats))
             else:
-
                 if not self._feb_warning_shown:
                     print(f"[WARNING] FEB feature not found for {video_item['id']}: {feb_path}")
                     self._feb_warning_shown = True
-
                 vmae_L = feats.shape[1]
-                data_dict['freq_evidence'] = torch.zeros(vmae_L, 196, 14, dtype=torch.float32)
+                data_dict['freq_evidence'] = torch.zeros(vmae_L, 196, 16, dtype=torch.float32)
 
 
 

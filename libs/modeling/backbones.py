@@ -119,7 +119,7 @@ class ConvTransformerBackbone(nn.Module):
             if module.bias is not None:
                 torch.nn.init.constant_(module.bias, 0.)
 
-    def forward(self, x, mask):
+    def forward(self, x, mask, return_aux=False):
 
 
         B, C, T = x.size()
@@ -153,20 +153,23 @@ class ConvTransformerBackbone(nn.Module):
 
             x = x + pe[:, :, :T] * mask.to(x.dtype)
 
-
+        last_attention = None
         for idx in range(len(self.stem)):
-            x, mask = self.stem[idx](x, mask)
-
+            if return_aux and idx == len(self.stem) - 1:
+                x, mask, last_attention = self.stem[idx](x, mask, return_attn=True)
+            else:
+                x, mask = self.stem[idx](x, mask)
 
         out_feats = (x, )
         out_masks = (mask, )
-
 
         for idx in range(len(self.branch)):
             x, mask = self.branch[idx](x, mask)
             out_feats += (x, )
             out_masks += (mask, )
 
+        if return_aux:
+            return out_feats, out_masks, {'attention': last_attention}
         return out_feats, out_masks
 
 

@@ -19,7 +19,7 @@ from libs.utils import (train_one_epoch, valid_one_epoch, ANETdetection,
                         save_checkpoint, make_optimizer, make_scheduler,
                         fix_random_seed, ModelEma, Logger,
                         DistillationWrapper, load_teacher_model)
-from libs.modeling import SKDDistillationWrapper, SKDDistillationWrapperV2, load_fcad_teacher
+from libs.modeling import SKDDistillationWrapper, load_fcad_teacher
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 
@@ -148,13 +148,13 @@ def main(args):
                 'use_teacher_calibrated_logits': distill_cfg.get('use_teacher_calibrated_logits', True),
                 'use_motion_clip_weight': distill_cfg.get('use_motion_clip_weight', True),
             }
-            model = SKDDistillationWrapperV2(
+            model = SKDDistillationWrapper(
                 student=model,
                 teacher=teacher,
                 skd_config=skd_config,
             )
-            print(f"SKD V2 Distillation: temperature={skd_config['temperature']}, "
-                  f"theta_conf={skd_config['theta_conf']}, gate={'ON' if skd_config['theta_conf'] > 0 else 'OFF'}")
+            print(f"SKD Distillation: temperature={skd_config['temperature']}, "
+                  f"theta_conf={skd_config['theta_conf']}")
         else:
 
             teacher = load_teacher_model(teacher_cfg_path, teacher_ckpt, cfg['devices'][0])

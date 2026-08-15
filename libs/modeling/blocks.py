@@ -1700,8 +1700,12 @@ class AligningEncoder(nn.Module):
         self.ln = LayerNorm(proj_dim)
 
 
-        self.lambda_param = nn.Parameter(torch.ones(1) * 2.0)
+        self._lambda_param = nn.Parameter(torch.ones(1) * 2.0)
         self.bias_param = nn.Parameter(torch.zeros(1))
+
+    @property
+    def lambda_d(self):
+        return F.softplus(self._lambda_param)
 
     def forward(self, attention, mask):
         """
@@ -1773,7 +1777,7 @@ class AligningEncoder(nn.Module):
         motion = F.pad(motion_diff, (1, 0), value=0)
 
 
-        motion_intensity = torch.sigmoid(self.lambda_param * motion + self.bias_param)
+        motion_intensity = torch.sigmoid(self.lambda_d * motion + self.bias_param)
 
 
         motion_intensity = motion_intensity * mask.squeeze(1).to(motion_intensity.dtype)

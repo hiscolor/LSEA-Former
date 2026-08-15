@@ -70,8 +70,7 @@ train_cfg:
     topk_ratio: 0.15
     topk_min: 6
     feb:
-      evidence_dim: 64
-      input_evidence_dim: 14
+      temporal_dim: 16
       topk_patches: 32
       num_heads: 2
   distillation:
@@ -92,7 +91,7 @@ opt:
   momentum: 0.9
   weight_decay: 0.05
   learning_rate: 0.0008
-  epochs: 15
+  epochs: 30
   warmup: linear
   warmup_epochs: 3
   schedule_type: cosine
