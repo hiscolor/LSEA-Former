@@ -244,8 +244,10 @@ class FCADFormer(nn.Module):
 
         feb_cfg = fcad_cfg.get('feb', {})
         self.feb_temporal_dim = feb_cfg.get('temporal_dim', 16)
+        self.feb_evidence_dim = feb_cfg.get('evidence_dim', 128)
         self.feb_topk_patches = feb_cfg.get('topk_patches', 64)
         self.feb_num_heads = feb_cfg.get('num_heads', 4)
+        self.clip_label_thresh = fcad_cfg.get('clip_label_thresh', 0.5)
 
 
         self.test_pre_nms_thresh = test_cfg['pre_nms_thresh']
@@ -335,6 +337,7 @@ class FCADFormer(nn.Module):
                 videomae_dim=total_input_dim,
                 hidden_dim=head_dim,
                 temporal_dim=self.feb_temporal_dim,
+                evidence_dim=self.feb_evidence_dim,
                 topk_patches=self.feb_topk_patches,
                 num_heads=self.feb_num_heads,
                 dropout=self.train_dropout,
@@ -354,10 +357,8 @@ class FCADFormer(nn.Module):
 
         if self.enable_cmam:
             stem_window = self.mha_win_size[0] if self.mha_win_size[0] > 0 else 7
-            self.avmc = AVMCModule(
-                n_head=n_head,
-                window_size=stem_window,
-            )
+            row_dim = 2 * (stem_window // 2) + 1
+            self.avmc = AVMCModule(row_dim=row_dim)
             self.motion_gate = MotionGateCalibration()
         else:
             self.avmc = None
@@ -580,27 +581,40 @@ class FCADFormer(nn.Module):
 
         return batched_inputs, batched_masks
 
+    def _build_clip_labels(self, video_list, clip_len, device):
+        labels = []
+        for video in video_list:
+            g = torch.zeros(clip_len, device=device)
+            segments = video.get('segments')
+            if segments is None or len(segments) == 0:
+                labels.append(g)
+                continue
+            feat_stride = float(video['feat_stride'])
+            num_frames = float(video['feat_num_frames'])
+            segs = segments.to(device)
+            for t in range(clip_len):
+                clip_start = t * feat_stride
+                clip_end = clip_start + num_frames
+                clip_dur = max(clip_end - clip_start, 1e-6)
+                max_overlap = 0.0
+                for seg in segs:
+                    ov_start = max(seg[0].item(), clip_start)
+                    ov_end = min(seg[1].item(), clip_end)
+                    if ov_end > ov_start:
+                        max_overlap = max(max_overlap, (ov_end - ov_start) / clip_dur)
+                if max_overlap > self.clip_label_thresh:
+                    g[t] = 1.0
+            labels.append(g)
+        return torch.stack(labels, dim=0)
+
     def _compute_losses(
         self, video_list, points, fpn_masks,
         out_cls_logits, out_offsets,
         seg_logits, seg_logits_calib, vid_logit,
         motion_intensity, mask_2d
     ):
-        """计算所有损失"""
-
-        gt_segments = []
-        gt_labels = []
         gt_video_labels = []
-
         for video in video_list:
-            if video['segments'] is not None:
-                gt_segments.append(video['segments'].to(self.device))
-                gt_labels.append(video['labels'].to(self.device))
-            else:
-                gt_segments.append(torch.zeros((0, 2), device=self.device))
-                gt_labels.append(torch.zeros((0,), dtype=torch.int64, device=self.device))
-
-
             if 'video_label' in video:
                 vid_label = video['video_label']
                 if isinstance(vid_label, torch.Tensor):
@@ -610,112 +624,34 @@ class FCADFormer(nn.Module):
             else:
                 has_segments = video['segments'] is not None and len(video['segments']) > 0
                 gt_video_labels.append(torch.tensor([1.0 if has_segments else 0.0], device=self.device))
-
         gt_video_labels = torch.cat(gt_video_labels)
 
-
-        gt_cls_labels, gt_offsets = self.label_points(points, gt_segments, gt_labels)
-
-
-        valid_mask = torch.cat(fpn_masks, dim=1)
-        gt_cls = torch.stack(gt_cls_labels)
-        pos_mask = torch.logical_and((gt_cls.sum(-1) > 0), valid_mask)
-
-        pred_offsets = torch.cat(out_offsets, dim=1)[pos_mask]
-        gt_offsets_stacked = torch.stack(gt_offsets)[pos_mask]
-
-        num_pos = pos_mask.sum().item()
-        self.loss_normalizer = self.loss_normalizer_momentum * self.loss_normalizer + (
-            1 - self.loss_normalizer_momentum
-        ) * max(num_pos, 1)
-
-        gt_target = gt_cls[valid_mask]
-        gt_target *= 1 - self.train_label_smoothing
-        gt_target += self.train_label_smoothing / (self.num_classes + 1)
-
-
-        loc_cls_loss = sigmoid_focal_loss(
-            torch.cat(out_cls_logits, dim=1)[valid_mask],
-            gt_target,
-            reduction='sum'
-        ) / self.loss_normalizer
-
-
-        if num_pos == 0:
-            reg_loss = torch.tensor(0.0, device=self.device)
-        else:
-            reg_loss = ctr_diou_loss_1d(
-                pred_offsets, gt_offsets_stacked, reduction='sum'
-            ) / self.loss_normalizer
-
-
-        B = seg_logits.shape[0]
-        L = seg_logits.shape[1]
-
-        gt_labels_flat = gt_video_labels.view(-1)
-
+        B, L = seg_logits_calib.shape
+        clip_labels = self._build_clip_labels(video_list, L, self.device)
 
         vid_smooth = 0.05
-        gt_smooth = gt_labels_flat * (1.0 - vid_smooth) + (1.0 - gt_labels_flat) * vid_smooth
-
+        clip_smooth = self.train_label_smoothing
+        gt_vid = gt_video_labels.view(-1)
+        gt_vid_smooth = gt_vid * (1.0 - vid_smooth) + (1.0 - gt_vid) * vid_smooth
         vid_logit_clamped = torch.clamp(vid_logit.view(-1), -6.0, 6.0)
         vid_loss = F.binary_cross_entropy_with_logits(
-            vid_logit_clamped, gt_smooth, reduction='mean'
+            vid_logit_clamped, gt_vid_smooth, reduction='mean'
         )
 
+        gt_clip_smooth = clip_labels * (1.0 - clip_smooth) + (1.0 - clip_labels) * (clip_smooth / 2.0)
+        valid_logits = seg_logits_calib.masked_fill(~mask_2d, 0.0)
+        valid_targets = gt_clip_smooth.masked_fill(~mask_2d, 0.0)
+        denom = mask_2d.float().sum().clamp(min=1.0)
+        clip_loss = F.binary_cross_entropy_with_logits(
+            valid_logits, valid_targets, reduction='sum'
+        ) / denom
 
-        first_fpn_len = fpn_masks[0].shape[1]
-        valid_seg_logits = seg_logits_calib[:, :first_fpn_len]
-        first_mask = fpn_masks[0][:, :first_fpn_len]
-        if first_mask.dim() == 3:
-            first_mask = first_mask.squeeze(1)
-
-        seg_losses = []
-        for b in range(B):
-            valid_mask_b = first_mask[b] > 0
-            num_valid = valid_mask_b.sum().item()
-            if num_valid == 0:
-                continue
-            valid_logits = valid_seg_logits[b][valid_mask_b]
-            video_label = gt_video_labels[b].item()
-
-            k = max(self.topk_min, int(num_valid * self.topk_ratio))
-            k = min(k, num_valid)
-
-            if video_label > 0.5:
-                topk_logits, _ = torch.topk(valid_logits, k)
-                topk_logits = torch.clamp(topk_logits, -6.0, 6.0)
-                target = torch.ones_like(topk_logits) * (1.0 - vid_smooth)
-                loss_b = F.binary_cross_entropy_with_logits(topk_logits, target, reduction='mean')
-            else:
-                topk_logits, _ = torch.topk(valid_logits, k)
-                topk_logits = torch.clamp(topk_logits, -6.0, 6.0)
-                target = torch.ones_like(topk_logits) * vid_smooth
-                loss_b = F.binary_cross_entropy_with_logits(topk_logits, target, reduction='mean')
-            seg_losses.append(loss_b)
-
-        if len(seg_losses) > 0:
-            seg_loss = torch.stack(seg_losses).mean()
-        else:
-            seg_loss = torch.tensor(0.0, device=self.device)
-
-
-        if self.train_loss_weight > 0:
-            loss_weight = self.train_loss_weight
-        else:
-            loss_weight = loc_cls_loss.detach() / max(reg_loss.item(), 0.01)
-
-        loc_loss = loc_cls_loss + reg_loss * loss_weight
-        video_cls_loss = self.lambda_seg * seg_loss + self.lambda_vid * vid_loss
-        final_loss = loc_loss + 0.5 * video_cls_loss
+        final_loss = self.lambda_seg * clip_loss + self.lambda_vid * vid_loss
 
         return {
-            'loc_cls_loss': loc_cls_loss,
-            'reg_loss': reg_loss,
-            'seg_loss': seg_loss,
+            'clip_loss': clip_loss,
             'vid_loss': vid_loss,
             'final_loss': final_loss,
-            'num_pos': torch.tensor(num_pos, device=self.device),
         }
 
     @torch.no_grad()

@@ -79,6 +79,7 @@ train_cfg:
     tau: 1.0
     feb:
       temporal_dim: 16
+      evidence_dim: 128
       topk_patches: 64
       num_heads: 4
 test_cfg:

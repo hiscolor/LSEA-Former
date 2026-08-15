@@ -64,33 +64,34 @@ train_cfg:
   fcad:
     enable_feb: true
     enable_cmam: true
-    lambda_seg: 1.5
-    lambda_vid: 1.5
+    lambda_seg: 1.0
+    lambda_vid: 0.5
     tau: 1.0
-    topk_ratio: 0.15
-    topk_min: 6
+    topk_ratio: 0.1
+    topk_min: 5
     feb:
       temporal_dim: 16
-      topk_patches: 32
-      num_heads: 2
+      evidence_dim: 128
+      topk_patches: 64
+      num_heads: 4
   distillation:
     enabled: true
     use_skd: true
     teacher_config: configs/fcad/fcad_feb_cmam_30ep.yaml
-    teacher_ckpt: outputs/fcad_teacher/fcad_feb_cmam_30ep_v10_cleaned/model_best.pth.tar
+    teacher_ckpt: checkpoints/teacher/model_best.pth.tar
     temperature: 4.0
     alpha: 0.5
     beta: 1.0
     theta_conf: 0.3
-    topk_ratio: 0.15
-    topk_min: 6
+    topk_ratio: 0.1
+    topk_min: 5
     kd_clip_weight: 1.0
     kd_vid_weight: 0.5
 opt:
   type: AdamW
   momentum: 0.9
   weight_decay: 0.05
-  learning_rate: 0.0008
+  learning_rate: 0.0005
   epochs: 30
   warmup: linear
   warmup_epochs: 3
