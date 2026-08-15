@@ -1,0 +1,96 @@
+dataset_name: tad_tvil
+train_split: ['train']
+val_split: ['validation']
+test_split: ['test']
+dataset:
+  json_file: data/TAD_TVIL/annotations/metadata.json
+  feat_folder: data/TAD_TVIL/npy_features
+  file_prefix: ~
+  file_ext: .npy
+  num_classes: 1
+  input_dim: 1408
+  feat_stride: 1
+  num_frames: 16
+  default_fps: ~
+  trunc_thresh: 0.5
+  crop_ratio: [0.9, 1.0]
+  max_seq_len: 768
+  force_upsampling: True
+  feb_feat_folder: data/TAD_TVIL/feb_features
+  enable_feb: True
+  audio_feat_folder: ~
+  audio_file_ext: .npy
+  audio_input_dim: 0
+model_name: FCADFormer
+model:
+  backbone_type: convTransformer
+  fpn_type: fpn
+  backbone_arch: [2, 2, 5]
+  scale_factor: 2
+  input_dim: 1408
+  audio_input_dim: 0
+  max_seq_len: 768
+  max_buffer_len_factor: 1.0
+  n_head: 4
+  n_mha_win_size: [7, 7, 7, 7, 7, -1]
+  embd_kernel_size: 3
+  embd_dim: 256
+  embd_with_ln: True
+  fpn_dim: 256
+  fpn_with_ln: True
+  fpn_start_level: 0
+  head_dim: 256
+  regression_range: [[0, 4], [4, 8], [8, 16], [16, 32], [32, 64], [64, 10000]]
+  head_num_layers: 3
+  head_kernel_size: 3
+  head_with_ln: True
+  use_abs_pe: True
+  use_rel_pe: False
+  num_classes: 1
+  mlp_ratio: 4.0
+opt:
+  learning_rate: 0.0005
+  epochs: 30
+  weight_decay: 0.05
+  warmup_epochs: 5
+  warmup: linear
+  schedule_type: cosine
+loader:
+  batch_size: 4
+  num_workers: 4
+train_cfg:
+  clip_grad_l2norm: 1.0
+  init_loss_norm: 200
+  head_empty_cls: []
+  dropout: 0.1
+  droppath: 0.1
+  cls_prior_prob: 0.01
+  center_sample: radius
+  center_sample_radius: 1.5
+  label_smoothing: 0.1
+  loss_weight: 2.0
+  fcad:
+    enable_feb: True
+    enable_cmam: True
+    lambda_seg: 1.0
+    lambda_vid: 0.5
+    topk_ratio: 0.1
+    topk_min: 5
+    tau: 1.0
+    feb:
+      evidence_dim: 128
+      input_evidence_dim: 14
+      topk_patches: 64
+      num_heads: 4
+test_cfg:
+  pre_nms_thresh: 0.001
+  pre_nms_topk: 2000
+  iou_threshold: 0.1
+  min_score: 0.001
+  max_seg_num: 100
+  nms_method: soft
+  multiclass_nms: False
+  nms_sigma: 0.75
+  duration_thresh: 0.001
+  voting_thresh: 0.9
+output_folder: outputs/fcad_teacher
