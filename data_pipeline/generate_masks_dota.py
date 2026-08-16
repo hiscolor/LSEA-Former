@@ -10,6 +10,8 @@ from ultralytics import YOLO
 
 from common import (
     FPS,
+    MAX_MASK_AREA_RATIO,
+    MIN_MASK_AREA_RATIO,
     OUT_H_DOTA,
     OUT_W,
     Sam2Segmentor,
@@ -23,7 +25,6 @@ from common import (
     load_gt_boxes_per_frame,
     make_mp4,
     mask_area_ratio,
-    mask_ratio_valid,
     read_video_json,
     select_seed_tracks,
     stitch_tracks_by_iou,
@@ -90,8 +91,11 @@ def process_video(video_dir, yolo, segmentor, device, overwrite=False):
             if ratio > 0:
                 min_ratio = min(min_ratio, ratio)
             cv2.imwrite(str(mask_dir / f"{frame_idx:06d}.png"), mask)
-    if not mask_ratio_valid(max_ratio, min_ratio if has_mask else min_ratio if min_ratio < 1.0 else 0.0):
-        return False, f"mask_ratio_{min_ratio:.4f}_{max_ratio:.4f}"
+    if not has_mask:
+        return False, "empty_mask"
+    min_nonzero = min_ratio if min_ratio < 1.0 else max_ratio
+    if max_ratio > MAX_MASK_AREA_RATIO or min_nonzero < MIN_MASK_AREA_RATIO:
+        return False, f"mask_ratio_{min_nonzero:.4f}_{max_ratio:.4f}"
     video_mp4 = video_dir / "video.mp4"
     mask_mp4 = video_dir / "mask.mp4"
     if overwrite or not video_mp4.exists():

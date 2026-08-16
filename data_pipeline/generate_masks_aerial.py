@@ -23,7 +23,6 @@ from common import (
     clip_box,
     ensure_dir,
     mask_area_ratio,
-    mask_ratio_valid,
 )
 
 CONF_THRES = 0.10
@@ -174,7 +173,7 @@ def process_video(video_path: Path, output_dir: Path, yolo, segmentor, rng, devi
             if start_frame <= frame_idx <= end_frame:
                 frame_to_boxes[frame_idx].append(box)
     max_ratio = 0.0
-    min_ratio = 1.0
+    min_nonzero = 1.0
     for frame_idx in range(n_frames):
         image = cv2.imread(str(frames_dir / f"{frame_idx:06d}.jpg"))
         if image is None:
@@ -186,9 +185,9 @@ def process_video(video_path: Path, output_dir: Path, yolo, segmentor, rng, devi
         ratio = mask_area_ratio(mask)
         max_ratio = max(max_ratio, ratio)
         if ratio > 0:
-            min_ratio = min(min_ratio, ratio)
+            min_nonzero = min(min_nonzero, ratio)
         cv2.imwrite(str(mask_dir / f"{frame_idx:06d}.png"), mask)
-    if not mask_ratio_valid(max_ratio, min_ratio if min_ratio < 1.0 else 0.0):
+    if min_nonzero >= 1.0 or max_ratio > MAX_MASK_AREA_RATIO or min_nonzero < MIN_MASK_AREA_RATIO:
         return None
     video_mp4 = out_dir / "video.mp4"
     mask_mp4 = out_dir / "mask.mp4"
