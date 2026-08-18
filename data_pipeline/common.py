@@ -1,7 +1,7 @@
 import json
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
@@ -21,10 +21,7 @@ YOLO_CLASSES = [0, 1, 2, 3, 5, 6, 7]
 CAR_CLASS_NAMES = {"car", "bus", "truck"}
 IOU_MATCH_THR = 0.50
 LINK_IOU_THR = 0.30
-BOX_EXPAND_RATIO = 0.12
-MASK_DILATE_PX = 2
 MAX_MASK_AREA_RATIO = 1.0 / 3.0
-MIN_MASK_AREA_RATIO = 1.0 / 30.0
 
 
 def ensure_dir(path: Path):
@@ -152,37 +149,23 @@ def make_mp4(frames_dir: Path, pattern: str, out_mp4: Path, fps: int, out_w: int
     subprocess.run(cmd, check=True)
 
 
-def expand_box(box, width, height, ratio=BOX_EXPAND_RATIO):
-    x1, y1, x2, y2 = box
-    bw = max(1, x2 - x1)
-    bh = max(1, y2 - y1)
-    px = int(round(bw * ratio))
-    py = int(round(bh * ratio))
-    return clip_box(x1 - px, y1 - py, x2 + px, y2 + py, width, height)
-
-
-def dilate_mask(mask, px=MASK_DILATE_PX):
-    if px <= 0:
-        return mask
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * px + 1, 2 * px + 1))
-    return cv2.dilate(mask, kernel, iterations=1)
-
-
 class Sam2Segmentor:
-    def __init__(self, weights=SAM2_WEIGHTS, expand_ratio=BOX_EXPAND_RATIO, dilate_px=MASK_DILATE_PX):
+    def __init__(self, weights=SAM2_WEIGHTS):
         self.model = SAM(weights)
-        self.expand_ratio = expand_ratio
-        self.dilate_px = dilate_px
 
     def segment_union(self, image_bgr, boxes):
         height, width = image_bgr.shape[:2]
         if not boxes:
             return np.zeros((height, width), dtype=np.uint8)
-        expanded = [expand_box(box, width, height, self.expand_ratio) for box in boxes]
+        clipped = [clip_box(x1, y1, x2, y2, width, height) for x1, y1, x2, y2 in boxes]
         try:
-            result = self.model(image_bgr, bboxes=[list(map(float, box)) for box in expanded], verbose=False)
+            result = self.model(
+                image_bgr,
+                bboxes=[list(map(float, box)) for box in clipped],
+                verbose=False,
+            )
             if not result or result[0].masks is None or result[0].masks.data is None:
-                return self._rect_union(width, height, expanded)
+                return self._rect_union(width, height, clipped)
             masks = result[0].masks.data
             if hasattr(masks, "cpu"):
                 masks = masks.float().cpu().numpy()
@@ -192,15 +175,16 @@ class Sam2Segmentor:
             union = (masks.max(axis=0) > 0.5).astype(np.uint8) * 255
             if union.shape != (height, width):
                 union = cv2.resize(union, (width, height), interpolation=cv2.INTER_NEAREST)
-            return dilate_mask(union, self.dilate_px)
+            return union
         except Exception:
-            return self._rect_union(width, height, expanded)
+            return self._rect_union(width, height, clipped)
 
-    def _rect_union(self, width, height, boxes):
+    @staticmethod
+    def _rect_union(width, height, boxes):
         union = np.zeros((height, width), dtype=np.uint8)
         for x1, y1, x2, y2 in boxes:
             union[y1:y2 + 1, x1:x2 + 1] = 255
-        return dilate_mask(union, self.dilate_px)
+        return union
 
 
 def collect_tracks(yolo, frames_dir, n_frames, width, height, device):
@@ -306,5 +290,5 @@ def mask_area_ratio(mask):
     return float((mask > 127).sum()) / float(mask.size)
 
 
-def mask_ratio_valid(max_ratio, min_ratio=MIN_MASK_AREA_RATIO, max_allowed=MAX_MASK_AREA_RATIO):
-    return min_ratio <= max_ratio <= max_allowed
+def mask_ratio_valid(max_ratio, max_allowed=MAX_MASK_AREA_RATIO):
+    return max_ratio <= max_allowed

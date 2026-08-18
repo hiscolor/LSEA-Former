@@ -11,7 +11,6 @@ from ultralytics import YOLO
 from common import (
     FPS,
     MAX_MASK_AREA_RATIO,
-    MIN_MASK_AREA_RATIO,
     OUT_H_DOTA,
     OUT_W,
     Sam2Segmentor,
@@ -52,7 +51,6 @@ def process_video(video_dir, yolo, segmentor, device, overwrite=False):
     ensure_dir(frame_dir)
     ensure_dir(mask_dir)
     max_ratio = 0.0
-    min_ratio = 1.0
     has_mask = False
     per_frame_noncar = []
     per_frame_car = []
@@ -73,10 +71,7 @@ def process_video(video_dir, yolo, segmentor, device, overwrite=False):
             mask = np.zeros((height, width), dtype=np.uint8)
         if mask.any():
             has_mask = True
-        ratio = mask_area_ratio(mask)
-        max_ratio = max(max_ratio, ratio)
-        if ratio > 0:
-            min_ratio = min(min_ratio, ratio)
+        max_ratio = max(max_ratio, mask_area_ratio(mask))
         cv2.imwrite(str(frame_dir / f"{frame_idx:06d}.jpg"), image)
         cv2.imwrite(str(mask_dir / f"{frame_idx:06d}.png"), mask)
     if not has_mask:
@@ -86,16 +81,12 @@ def process_video(video_dir, yolo, segmentor, device, overwrite=False):
                 continue
             boxes = per_frame_noncar[frame_idx] + per_frame_car[frame_idx]
             mask = segmentor.segment_union(image, boxes) if boxes else np.zeros((height, width), dtype=np.uint8)
-            ratio = mask_area_ratio(mask)
-            max_ratio = max(max_ratio, ratio)
-            if ratio > 0:
-                min_ratio = min(min_ratio, ratio)
+            max_ratio = max(max_ratio, mask_area_ratio(mask))
             cv2.imwrite(str(mask_dir / f"{frame_idx:06d}.png"), mask)
     if not has_mask:
         return False, "empty_mask"
-    min_nonzero = min_ratio if min_ratio < 1.0 else max_ratio
-    if max_ratio > MAX_MASK_AREA_RATIO or min_nonzero < MIN_MASK_AREA_RATIO:
-        return False, f"mask_ratio_{min_nonzero:.4f}_{max_ratio:.4f}"
+    if max_ratio > MAX_MASK_AREA_RATIO:
+        return False, f"mask_ratio_{max_ratio:.4f}"
     video_mp4 = video_dir / "video.mp4"
     mask_mp4 = video_dir / "mask.mp4"
     if overwrite or not video_mp4.exists():
