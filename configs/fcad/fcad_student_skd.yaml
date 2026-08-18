@@ -70,10 +70,9 @@ train_cfg:
     topk_ratio: 0.1
     topk_min: 5
     feb:
+      input_evidence_dim: 14
       temporal_dim: 16
-      evidence_dim: 128
       topk_patches: 64
-      num_heads: 4
   distillation:
     enabled: true
     use_skd: true

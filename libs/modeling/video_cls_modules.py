@@ -181,35 +181,43 @@ class FrequencyEvidenceBranch(nn.Module):
         self,
         videomae_dim=1408,
         hidden_dim=256,
-        temporal_dim=16,
-        evidence_dim=128,
         topk_patches=64,
-        num_heads=4,
         dropout=0.1,
+        input_evidence_dim=14,
+        temporal_dim=16,
     ):
         super().__init__()
         self.videomae_dim = videomae_dim
         self.hidden_dim = hidden_dim
-        self.temporal_dim = temporal_dim
-        self.evidence_dim = evidence_dim
         self.topk_patches = topk_patches
-        self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
+        self.input_evidence_dim = input_evidence_dim
+        self.temporal_dim = temporal_dim
         self.evidence_mlp = nn.Sequential(
             nn.Linear(temporal_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, evidence_dim),
+            nn.Linear(hidden_dim, temporal_dim),
         )
-        self.score_proj = nn.Linear(evidence_dim, 1)
         self.query_proj = nn.Linear(videomae_dim, hidden_dim)
-        self.key_proj = nn.Linear(evidence_dim, hidden_dim)
-        self.value_proj = nn.Linear(evidence_dim, hidden_dim)
+        self.key_proj = nn.Linear(temporal_dim, hidden_dim)
+        self.value_proj = nn.Linear(temporal_dim, hidden_dim)
         self.fusion_proj = nn.Linear(hidden_dim, videomae_dim)
         nn.init.zeros_(self.fusion_proj.weight)
         nn.init.zeros_(self.fusion_proj.bias)
         self.attn_dropout = nn.Dropout(dropout)
-        self.scale = self.head_dim ** -0.5
+        self.scale = hidden_dim ** -0.5
+
+    def _prepare_input(self, freq_evidence):
+        c = freq_evidence[..., :self.temporal_dim]
+        if c.shape[-1] < self.temporal_dim:
+            pad = torch.zeros(
+                *c.shape[:-1],
+                self.temporal_dim - c.shape[-1],
+                device=c.device,
+                dtype=c.dtype,
+            )
+            c = torch.cat([c, pad], dim=-1)
+        return c
 
     def forward(self, videomae_feats, freq_evidence, mask=None):
         if videomae_feats.shape[1] != videomae_feats.shape[-1]:
@@ -217,31 +225,20 @@ class FrequencyEvidenceBranch(nn.Module):
                 videomae_feats = videomae_feats.permute(0, 2, 1)
         B, L, D = videomae_feats.shape
         P = freq_evidence.shape[2]
-        K = min(self.temporal_dim, freq_evidence.shape[-1])
-        c = freq_evidence[..., :K]
-        if K < self.temporal_dim:
-            pad = torch.zeros(
-                *c.shape[:-1], self.temporal_dim - K,
-                device=c.device, dtype=c.dtype
-            )
-            c = torch.cat([c, pad], dim=-1)
+        c = self._prepare_input(freq_evidence)
         e = self.evidence_mlp(c)
-        patch_scores = self.score_proj(e).squeeze(-1)
+        patch_scores = e.mean(dim=-1)
         Kp = min(self.topk_patches, P)
         _, topk_indices = torch.topk(patch_scores, Kp, dim=2)
-        topk_indices_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, -1, self.evidence_dim)
+        topk_indices_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, -1, self.temporal_dim)
         topk_e = torch.gather(e, 2, topk_indices_expanded)
         q = self.query_proj(videomae_feats)
         k = self.key_proj(topk_e)
         v = self.value_proj(topk_e)
-        q = q.view(B, L, self.num_heads, self.head_dim)
-        k = k.view(B, L, Kp, self.num_heads, self.head_dim)
-        v = v.view(B, L, Kp, self.num_heads, self.head_dim)
-        attn_logits = torch.einsum('blhd,blkhd->blhk', q, k) * self.scale
-        attn_weights = F.softmax(attn_logits, dim=3)
+        attn_logits = torch.einsum('bld,blkd->blk', q, k) * self.scale
+        attn_weights = F.softmax(attn_logits, dim=2)
         attn_weights = self.attn_dropout(attn_weights)
-        context = torch.einsum('blhk,blkhd->blhd', attn_weights, v)
-        context = context.reshape(B, L, self.hidden_dim)
+        context = torch.einsum('blk,blkd->bld', attn_weights, v)
         fusion_delta = self.fusion_proj(context)
         fused_feats = videomae_feats + fusion_delta
         fused_feats = fused_feats.permute(0, 2, 1)
@@ -249,5 +246,4 @@ class FrequencyEvidenceBranch(nn.Module):
             if mask.dim() == 2:
                 mask = mask.unsqueeze(1)
             fused_feats = fused_feats * mask.float()
-        attn_summary = attn_weights.mean(dim=2)
-        return fused_feats, topk_indices, attn_summary
+        return fused_feats, topk_indices, attn_weights

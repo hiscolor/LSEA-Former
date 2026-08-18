@@ -78,10 +78,9 @@ train_cfg:
     topk_min: 5
     tau: 1.0
     feb:
+      input_evidence_dim: 14
       temporal_dim: 16
-      evidence_dim: 128
       topk_patches: 64
-      num_heads: 4
 test_cfg:
   pre_nms_thresh: 0.001
   pre_nms_topk: 2000

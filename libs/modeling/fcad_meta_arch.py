@@ -243,10 +243,9 @@ class FCADFormer(nn.Module):
 
 
         feb_cfg = fcad_cfg.get('feb', {})
+        self.feb_input_evidence_dim = feb_cfg.get('input_evidence_dim', 14)
         self.feb_temporal_dim = feb_cfg.get('temporal_dim', 16)
-        self.feb_evidence_dim = feb_cfg.get('evidence_dim', 128)
         self.feb_topk_patches = feb_cfg.get('topk_patches', 64)
-        self.feb_num_heads = feb_cfg.get('num_heads', 4)
         self.clip_label_thresh = fcad_cfg.get('clip_label_thresh', 0.5)
 
 
@@ -336,11 +335,10 @@ class FCADFormer(nn.Module):
             self.feb = FrequencyEvidenceBranch(
                 videomae_dim=total_input_dim,
                 hidden_dim=head_dim,
-                temporal_dim=self.feb_temporal_dim,
-                evidence_dim=self.feb_evidence_dim,
                 topk_patches=self.feb_topk_patches,
-                num_heads=self.feb_num_heads,
                 dropout=self.train_dropout,
+                input_evidence_dim=self.feb_input_evidence_dim,
+                temporal_dim=self.feb_temporal_dim,
             )
         else:
             self.feb = None
